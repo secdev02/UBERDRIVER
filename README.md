@@ -27,7 +27,78 @@ Custom Kernel Signers (CKS) allows users to decide what certificates are trusted
 
 The SIPolicy.bin file (which defines trusted signers) is loaded during the early boot process and enforced by CI.dll in kernel mode. The validation never touches user mode—CI.DLL is not callable outside the kernel, ensuring that signature checks cannot be bypassed from user-mode code.
 
+Approach 
 
+I'll search for information about the kernel structures that handle driver signature verification and custom kernel signers.Based on the research, here's what I found about kernel structures that hold approved kernel driver signers:
+
+## Key Kernel Structures and Components
+
+### **CI.dll Global Variables**
+
+The Code Integrity module (CI.dll) contains several critical global variables that control driver signature enforcement:
+
+- **`CI!g_CiOptions`** - A configuration variable with flags that control Driver Signature Enforcement (DSE), typically set to 0 to completely disable DSE
+- **`nt!SeCiCallbacks`** (or `nt!g_CiCallbacks`) - A callback structure filled by CiInitialize() containing function pointers like CiValidateImageHeader() and CiValidateImageData()
+
+### **Certificate Validation Structures**
+
+During signature validation, CI.dll uses specific structures to hold certificate information:
+
+**PolicyInfo Structure:**
+```c
+typedef struct _PolicyInfo {
+    int structSize;
+    NTSTATUS verificationStatus;
+    int flags;
+    PVOID certChainInfo;  // Pointer to certificate chain data
+    FILETIME revocationTime;
+    FILETIME notBeforeTime;
+    FILETIME notAfterTime;
+} PolicyInfo;
+```
+
+The certChainInfo buffer contains data about the entire certificate chain in both parsed format (organized sub-structures) and raw format (ASN.1 certificate blobs, keys, EKUs), making it easy to check the subject, issuer, certificate chain, and hash algorithms.
+
+## Custom Kernel Signers (WDAC Policies)
+
+Yes, **custom kernel signers are supported through Windows Defender Application Control (WDAC)** policies:
+
+### **Policy Storage Locations**
+
+WDAC policies containing custom signer information are stored at:
+
+- **Single policy format**: 
+  - `C:\Windows\System32\CodeIntegrity\SiPolicy.p7b`
+  - `<EFI System Partition>\Microsoft\Boot\SiPolicy.p7b`
+  
+- **Multiple policy format** (Windows 10 1903+):
+  - `C:\Windows\System32\CodeIntegrity\CiPolicies\Active\{PolicyGUID}.cip`
+  - `<EFI System Partition>\Microsoft\Boot\CiPolicies\Active\{PolicyGUID}.cip`
+
+- **Microsoft recommended driver blocks**:
+  - `driversipolicy.p7b` in the `%windir%\system32\CodeIntegrity` directory, which contains blocks enforced by HVCI, Smart App Control, or S mode
+
+### **How Policies Work**
+
+When the operating system boots, either WINLOAD or the kernel CI driver loads the policy from disk into memory and begins enforcement based on the configured rules. The policy files contain:
+
+- **Signer definitions** with certificate TBS (To-Be-Signed) hashes
+- **Extended Key Usage (EKU)** requirements
+- **Rule options** (like requiring EV certificates for kernel drivers)
+- **UpdatePolicySigners** - certificates authorized to update the policy
+
+## In-Memory Certificate Validation
+
+Functions like CiCheckSignedFile() and CiValidateFileObject() are exported by CI.dll to validate signatures, and the ntoskrnl.exe uses CiValidateImageHeader() when loading drivers. These functions:
+
+1. Extract certificates from the PE signature
+2. Validate against the loaded WDAC policy rules
+3. Check certificate chains and EKUs
+4. Return validation results in the PolicyInfo structure
+
+The actual certificate data from loaded policies resides in CI.dll's memory space, managed by internal functions like `MinCryptVerifyCertificateWithPolicy2()`.
+
+**Note**: Custom kernel signers use a specific OID (1.3.6.1.4.1.311.79.1) when signing policy files to indicate the content is specifically a WDAC policy.
 
 
 
