@@ -27,7 +27,7 @@ Custom Kernel Signers (CKS) allows users to decide what certificates are trusted
 
 The SIPolicy.bin file (which defines trusted signers) is loaded during the early boot process and enforced by CI.dll in kernel mode. The validation never touches user mode—CI.DLL is not callable outside the kernel, ensuring that signature checks cannot be bypassed from user-mode code.
 
-Would you like more details about any specific aspect of the validation chain?
+
 
 
 
