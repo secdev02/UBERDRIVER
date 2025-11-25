@@ -1,9 +1,7 @@
 # UBERDRIVER
 Kernel Signed Driver Validation Research 
 
-
-
-I'll search for information about Windows Custom Kernel Signers and driver validation to help answer your question.Let me search for more specific information about where the Code Integrity validation actually occurs.Let me get more specific details about Custom Kernel Signers and where the policy validation occurs.Based on my research, I can give you a clear answer about where driver validation occurs with Windows Custom Kernel Signers (CKS):
+CLAUDE AI Created README.
 
 ## Driver Validation Happens in **Kernel Mode**
 
