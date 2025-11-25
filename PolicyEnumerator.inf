@@ -1,0 +1,50 @@
+;
+; PolicyEnumerator.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=11/25/2025,1.0.0.0
+CatalogFile=PolicyEnumerator.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+PolicyEnumerator.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%PolicyEnumerator.DeviceDesc%=PolicyEnumerator_Install,Root\PolicyEnumerator
+
+[PolicyEnumerator_Install.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+PolicyEnumerator.sys
+
+[PolicyEnumerator_Install.NT.Services]
+AddService = PolicyEnumerator,%SPSVCINST_ASSOCSERVICE%,PolicyEnumerator_Service_Inst
+
+[PolicyEnumerator_Service_Inst]
+DisplayName    = %PolicyEnumerator.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\PolicyEnumerator.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName="Testing Research"
+DiskName = "PolicyEnumerator Installation Disk"
+PolicyEnumerator.DeviceDesc = "WDAC Policy Enumerator Driver"
+PolicyEnumerator.SVCDESC = "WDAC Policy Enumerator Driver"
+
