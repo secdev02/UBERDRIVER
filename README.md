@@ -8,6 +8,8 @@ The aim, take a problem, question for research, and use Claude to augment, enric
 
 Research Aim - Understand and Extend and exploit custom signed kernel drivers.
 
+Check claims for accuracy, test, validate, challenge, learn.
+
 ## Driver Validation Happens in **Kernel Mode**
 
 The driver signature validation is performed entirely in kernel mode through the **CI.dll** (Code Integrity) module. Here's the breakdown:
@@ -442,3 +444,9 @@ This code is provided for educational and testing purposes. Use at your own risk
 
 This driver directly interacts with security-critical system components. Improper use could affect system stability or security. Always test in isolated environments first.
 
+
+
+Inpsired by - Learn to pick up and think like an adversary and use their tools.
+
+
+<img width="244" height="207" alt="image" src="https://github.com/user-attachments/assets/ceaa0146-6326-4e3e-a58e-4c852b292364" />
