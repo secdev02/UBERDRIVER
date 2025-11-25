@@ -2,7 +2,11 @@
 # UBERDRIVER
 Kernel Signed Driver Validation Research 
 
-CLAUDE AI Created README.
+CLAUDE AI Assisted / Guided Research - Claude created this README for example.
+
+The aim, take a problem, question for research, and use Claude to augment, enrich, enhance.
+
+Research Aim - Understand and Extend and exploit custom signed kernel drivers.
 
 ## Driver Validation Happens in **Kernel Mode**
 
