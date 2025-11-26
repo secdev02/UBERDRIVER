@@ -1,10 +1,13 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
-using System.ComponentModel;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using Microsoft.Win32;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
 
 namespace CustomKernelSignerReader
 {
@@ -42,9 +45,35 @@ namespace CustomKernelSignerReader
             IntPtr PreviousState,
             IntPtr ReturnLength);
 
+        [DllImport("crypt32.dll", SetLastError = true)]
+        private static extern bool CryptQueryObject(
+            int dwObjectType,
+            IntPtr pvObject,
+            int dwExpectedContentTypeFlags,
+            int dwExpectedFormatTypeFlags,
+            int dwFlags,
+            out int pdwMsgAndCertEncodingType,
+            out int pdwContentType,
+            out int pdwFormatType,
+            ref IntPtr phCertStore,
+            ref IntPtr phMsg,
+            ref IntPtr ppvContext);
+
+        [DllImport("crypt32.dll", SetLastError = true)]
+        private static extern bool CertCloseStore(IntPtr hCertStore, int dwFlags);
+
+        [DllImport("crypt32.dll", SetLastError = true)]
+        private static extern IntPtr CertEnumCertificatesInStore(IntPtr hCertStore, IntPtr pPrevCertContext);
+
+        [DllImport("crypt32.dll", SetLastError = true)]
+        private static extern bool CertFreeCertificateContext(IntPtr pCertContext);
+
         // Constants
+        private const int CERT_QUERY_OBJECT_FILE = 0x00000001;
+        private const int CERT_QUERY_CONTENT_FLAG_ALL = 0x00003FFE;
+        private const int CERT_QUERY_FORMAT_FLAG_ALL = 0x0000000E;
+        
         private const int SystemCodeIntegrityInformation = 103;
-        private const int SystemCodeIntegrityPolicyInformation = 218;
         private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
         private const uint TOKEN_QUERY = 0x0008;
         private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
@@ -78,29 +107,29 @@ namespace CustomKernelSignerReader
             public uint CodeIntegrityOptions;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CERT_CONTEXT
+        {
+            public uint dwCertEncodingType;
+            public IntPtr pbCertEncoded;
+            public uint cbCertEncoded;
+            public IntPtr pCertInfo;
+            public IntPtr hCertStore;
+        }
+
         // Code Integrity Options flags
         private const uint CODEINTEGRITY_OPTION_ENABLED = 0x01;
         private const uint CODEINTEGRITY_OPTION_TESTSIGN = 0x02;
         private const uint CODEINTEGRITY_OPTION_UMCI_ENABLED = 0x04;
-        private const uint CODEINTEGRITY_OPTION_UMCI_AUDITMODE_ENABLED = 0x08;
-        private const uint CODEINTEGRITY_OPTION_UMCI_EXCLUSIONPATHS_ENABLED = 0x10;
-        private const uint CODEINTEGRITY_OPTION_TEST_BUILD = 0x20;
-        private const uint CODEINTEGRITY_OPTION_PREPRODUCTION_BUILD = 0x40;
         private const uint CODEINTEGRITY_OPTION_DEBUGMODE_ENABLED = 0x80;
-        private const uint CODEINTEGRITY_OPTION_FLIGHT_BUILD = 0x100;
-        private const uint CODEINTEGRITY_OPTION_FLIGHTING_ENABLED = 0x200;
         private const uint CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED = 0x400;
-        private const uint CODEINTEGRITY_OPTION_HVCI_KMCI_AUDITMODE_ENABLED = 0x800;
-        private const uint CODEINTEGRITY_OPTION_HVCI_KMCI_STRICTMODE_ENABLED = 0x1000;
 
-        // Check if running as SYSTEM
         public static bool IsRunningAsSystem()
         {
             WindowsIdentity identity = WindowsIdentity.GetCurrent();
             return identity.IsSystem;
         }
 
-        // Enable debug privilege
         private static bool EnableDebugPrivilege()
         {
             IntPtr tokenHandle;
@@ -128,7 +157,6 @@ namespace CustomKernelSignerReader
             return AdjustTokenPrivileges(tokenHandle, false, ref tokenPrivileges, 0, IntPtr.Zero, IntPtr.Zero);
         }
 
-        // Query Code Integrity status
         public static void QueryCodeIntegrityStatus()
         {
             Console.WriteLine("=== Code Integrity Status ===");
@@ -160,7 +188,7 @@ namespace CustomKernelSignerReader
                 if ((ciInfo.CodeIntegrityOptions & CODEINTEGRITY_OPTION_ENABLED) != 0)
                     Console.WriteLine("  - Code Integrity Enabled");
                 if ((ciInfo.CodeIntegrityOptions & CODEINTEGRITY_OPTION_TESTSIGN) != 0)
-                    Console.WriteLine("  - Test Signing Enabled");
+                    Console.WriteLine("  - Test Signing Enabled (TESTSIGN)");
                 if ((ciInfo.CodeIntegrityOptions & CODEINTEGRITY_OPTION_UMCI_ENABLED) != 0)
                     Console.WriteLine("  - User Mode Code Integrity (UMCI) Enabled");
                 if ((ciInfo.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0)
@@ -179,240 +207,505 @@ namespace CustomKernelSignerReader
             Marshal.FreeHGlobal(ciInfoPtr);
         }
 
-        // Read Custom Kernel Signers from registry and certificate stores
         public static void ReadCustomKernelSigners()
         {
-            Console.WriteLine("=== Custom Kernel Signers ===");
+            Console.WriteLine("=== Searching for Custom Kernel Signers ===");
             Console.WriteLine();
 
-            // Check CI Policy registry locations
-            ReadCIPolicyFromRegistry();
+            // 1. Parse WDAC policy files for embedded certificates
+            ParseWDACPolicyFiles();
 
-            // Check certificate stores
-            ReadTrustedKernelSigners();
+            // 2. Check registry for policy information
+            ReadDetailedPolicyRegistry();
 
-            // Check for supplemental policies
-            ReadSupplementalPolicies();
+            // 3. Check all certificate stores thoroughly
+            ScanAllCertificateStores();
+
+            // 4. Check for test-signed drivers
+            CheckTestSignedDrivers();
+
+            // 5. Check SiPolicy.p7b
+            ParseSiPolicyFile();
+
+            // 6. Check UEFI Secure Boot variables (if accessible)
+            CheckSecureBootVariables();
+
+            // 7. Scan driver store for custom signed drivers
+            ScanDriverStore();
         }
 
-        private static void ReadCIPolicyFromRegistry()
+        private static void ParseWDACPolicyFiles()
         {
-            Console.WriteLine("--- Code Integrity Policies (Registry) ---");
-            
-            string[] policyPaths = new string[]
-            {
-                @"SYSTEM\CurrentControlSet\Control\CI\Policy",
-                @"SYSTEM\CurrentControlSet\Control\CI\PolicyInformation",
-                @"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\SystemGuard"
-            };
-
-            foreach (string path in policyPaths)
-            {
-                try
-                {
-                    using (RegistryKey key = Registry.LocalMachine.OpenSubKey(path))
-                    {
-                        if (key != null)
-                        {
-                            Console.WriteLine(String.Format("Policy Path: HKLM\\{0}", path));
-                            
-                            string[] valueNames = key.GetValueNames();
-                            foreach (string valueName in valueNames)
-                            {
-                                object value = key.GetValue(valueName);
-                                Console.WriteLine(String.Format("  {0} = {1}", valueName, value));
-                            }
-                            Console.WriteLine();
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(String.Format("Unable to read {0}: {1}", path, ex.Message));
-                }
-            }
-        }
-
-        private static void ReadTrustedKernelSigners()
-        {
-            Console.WriteLine("--- Trusted Kernel Mode Code Signing Certificates ---");
+            Console.WriteLine("--- Parsing WDAC Policy Files (.cip) ---");
             Console.WriteLine();
 
-            // Check Windows Component Store
-            ReadCertificateStore(StoreName.TrustedPublisher, StoreLocation.LocalMachine, "Trusted Publisher (Kernel)");
-            
-            // Check Code Signing store
-            ReadCertificateStore(StoreName.Root, StoreLocation.LocalMachine, "Trusted Root (Kernel)");
-
-            // Check for EKU specific to kernel signing
-            ReadKernelCodeSigningCertificates();
-        }
-
-        // Replace the ReadCertificateStore method with this corrected version:
-private static void ReadCertificateStore(StoreName storeName, StoreLocation storeLocation, string description)
-{
-    try
-    {
-        X509Store store = new X509Store(storeName, storeLocation);
-        store.Open(OpenFlags.ReadOnly);
-
-        Console.WriteLine(String.Format("{0} ({1} certificates):", description, store.Certificates.Count));
-
-        int relevantCount = 0;
-        foreach (X509Certificate2 cert in store.Certificates)
-        {
-            // Check if certificate has kernel code signing capabilities
-            if (IsKernelCodeSigningCert(cert))
-            {
-                relevantCount++;
-                Console.WriteLine(String.Format("  Subject: {0}", cert.Subject));
-                Console.WriteLine(String.Format("  Issuer: {0}", cert.Issuer));
-                Console.WriteLine(String.Format("  Thumbprint: {0}", cert.Thumbprint));
-                Console.WriteLine(String.Format("  Valid: {0} to {1}", cert.NotBefore, cert.NotAfter));
-                
-                // Display EKU
-                foreach (X509Extension eku in cert.Extensions)  // Fixed: X509Extension not X509Enhancement
-                {
-                    if (eku.Oid.Value == "2.5.29.37") // Enhanced Key Usage
-                    {
-                        X509EnhancedKeyUsageExtension ekuExt = (X509EnhancedKeyUsageExtension)eku;
-                        Console.WriteLine("  Enhanced Key Usage:");
-                        foreach (System.Security.Cryptography.Oid oid in ekuExt.EnhancedKeyUsages)  // Fixed: Added full namespace
-                        {
-                            Console.WriteLine(String.Format("    - {0} ({1})", oid.FriendlyName, oid.Value));
-                        }
-                    }
-                }
-                Console.WriteLine();
-            }
-        }
-
-        if (relevantCount == 0)
-        {
-            Console.WriteLine("  (No kernel code signing certificates found)");
-        }
-
-        store.Close();
-        Console.WriteLine();
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine(String.Format("Error reading certificate store: {0}", ex.Message));
-        Console.WriteLine();
-    }
-}
-
-// Replace the IsKernelCodeSigningCert method with this corrected version:
-private static bool IsKernelCodeSigningCert(X509Certificate2 cert)
-{
-    // Check for Windows System Component Verification EKU (1.3.6.1.4.1.311.10.3.6)
-    // or Kernel Mode Code Signing (1.3.6.1.4.1.311.61.1.1)
-    foreach (X509Extension ext in cert.Extensions)
-    {
-        if (ext.Oid.Value == "2.5.29.37")
-        {
-            X509EnhancedKeyUsageExtension ekuExt = (X509EnhancedKeyUsageExtension)ext;
-            foreach (System.Security.Cryptography.Oid oid in ekuExt.EnhancedKeyUsages)  // Fixed: Added full namespace
-            {
-                if (oid.Value == "1.3.6.1.4.1.311.10.3.6" || // Windows System Component Verification
-                    oid.Value == "1.3.6.1.4.1.311.61.1.1")   // Kernel Mode Code Signing
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-        private static void ReadKernelCodeSigningCertificates()
-        {
-            Console.WriteLine("--- Kernel Mode Code Signing Specific Certificates ---");
+            string policyDir = @"C:\Windows\System32\CodeIntegrity\CiPolicies\Active";
             
             try
             {
-                X509Store store = new X509Store(StoreName.TrustedPublisher, StoreLocation.LocalMachine);
-                store.Open(OpenFlags.ReadOnly);
-
-                X509Certificate2Collection kernelCerts = store.Certificates.Find(
-                    X509FindType.FindByApplicationPolicy,
-                    "1.3.6.1.4.1.311.61.1.1", // Kernel Mode Code Signing OID
-                    false);
-
-                Console.WriteLine(String.Format("Found {0} certificates with Kernel Mode Code Signing EKU:", kernelCerts.Count));
-                Console.WriteLine();
-
-                foreach (X509Certificate2 cert in kernelCerts)
+                if (Directory.Exists(policyDir))
                 {
-                    Console.WriteLine(String.Format("  Subject: {0}", cert.Subject));
-                    Console.WriteLine(String.Format("  Issuer: {0}", cert.Issuer));
-                    Console.WriteLine(String.Format("  Thumbprint: {0}", cert.Thumbprint));
-                    Console.WriteLine(String.Format("  Serial: {0}", cert.SerialNumber));
-                    Console.WriteLine(String.Format("  Valid: {0} to {1}", cert.NotBefore, cert.NotAfter));
-                    Console.WriteLine();
-                }
+                    string[] cipFiles = Directory.GetFiles(policyDir, "*.cip");
+                    
+                    if (cipFiles.Length > 0)
+                    {
+                        Console.WriteLine(String.Format("Found {0} policy file(s)", cipFiles.Length));
+                        Console.WriteLine();
 
-                store.Close();
+                        foreach (string cipFile in cipFiles)
+                        {
+                            Console.WriteLine(String.Format("Policy: {0}", Path.GetFileName(cipFile)));
+                            ExtractCertificatesFromPolicy(cipFile);
+                            Console.WriteLine();
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("No .cip policy files found");
+                        Console.WriteLine();
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine(String.Format("Error: {0}", ex.Message));
+                Console.WriteLine();
             }
-            Console.WriteLine();
         }
 
-        private static void ReadSupplementalPolicies()
+        private static void ExtractCertificatesFromPolicy(string policyFile)
         {
-            Console.WriteLine("--- Supplemental Code Integrity Policies ---");
-            Console.WriteLine();
-
-            string policyPath = @"C:\Windows\System32\CodeIntegrity\CiPolicies\Active";
-            
             try
             {
-                if (System.IO.Directory.Exists(policyPath))
+                // .cip files are PKCS#7 signed data structures
+                IntPtr hCertStore = IntPtr.Zero;
+                IntPtr hMsg = IntPtr.Zero;
+                IntPtr pContext = IntPtr.Zero;
+                
+                IntPtr fileNamePtr = Marshal.StringToCoTaskMemUni(policyFile);
+                
+                int dwMsgAndCertEncodingType;
+                int dwContentType;
+                int dwFormatType;
+
+                bool result = CryptQueryObject(
+                    CERT_QUERY_OBJECT_FILE,
+                    fileNamePtr,
+                    CERT_QUERY_CONTENT_FLAG_ALL,
+                    CERT_QUERY_FORMAT_FLAG_ALL,
+                    0,
+                    out dwMsgAndCertEncodingType,
+                    out dwContentType,
+                    out dwFormatType,
+                    ref hCertStore,
+                    ref hMsg,
+                    ref pContext);
+
+                Marshal.FreeCoTaskMem(fileNamePtr);
+
+                if (result && hCertStore != IntPtr.Zero)
                 {
-                    string[] policyFiles = System.IO.Directory.GetFiles(policyPath, "*.cip");
+                    Console.WriteLine("  Certificates embedded in policy:");
                     
-                    Console.WriteLine(String.Format("Found {0} active policy files:", policyFiles.Length));
-                    foreach (string file in policyFiles)
+                    IntPtr pCertContext = IntPtr.Zero;
+                    int certCount = 0;
+
+                    while ((pCertContext = CertEnumCertificatesInStore(hCertStore, pCertContext)) != IntPtr.Zero)
                     {
-                        System.IO.FileInfo fileInfo = new System.IO.FileInfo(file);
-                        Console.WriteLine(String.Format("  {0} ({1} bytes, modified: {2})", 
-                            fileInfo.Name, 
-                            fileInfo.Length, 
-                            fileInfo.LastWriteTime));
+                        CERT_CONTEXT certContext = Marshal.PtrToStructure<CERT_CONTEXT>(pCertContext);
+                        
+                        byte[] certData = new byte[certContext.cbCertEncoded];
+                        Marshal.Copy(certContext.pbCertEncoded, certData, 0, (int)certContext.cbCertEncoded);
+                        
+                        X509Certificate2 cert = new X509Certificate2(certData);
+                        
+                        certCount++;
+                        Console.WriteLine(String.Format("    Certificate {0}:", certCount));
+                        Console.WriteLine(String.Format("      Subject: {0}", cert.Subject));
+                        Console.WriteLine(String.Format("      Issuer: {0}", cert.Issuer));
+                        Console.WriteLine(String.Format("      Thumbprint: {0}", cert.Thumbprint));
+                        Console.WriteLine(String.Format("      Serial: {0}", cert.SerialNumber));
+                        Console.WriteLine(String.Format("      Valid: {0} to {1}", cert.NotBefore, cert.NotAfter));
+                        
+                        // Check for signing capabilities
+                        DisplayCertificateCapabilities(cert);
+                        Console.WriteLine();
                     }
-                    Console.WriteLine();
+
+                    if (certCount == 0)
+                    {
+                        Console.WriteLine("    No certificates found in policy");
+                    }
+
+                    CertCloseStore(hCertStore, 0);
                 }
                 else
                 {
-                    Console.WriteLine("Policy directory not found.");
-                    Console.WriteLine();
+                    Console.WriteLine(String.Format("  Unable to parse policy file (Error: {0})", Marshal.GetLastWin32Error()));
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine(String.Format("Error reading policies: {0}", ex.Message));
+                Console.WriteLine(String.Format("  Error parsing policy: {0}", ex.Message));
+            }
+        }
+
+        private static void ParseSiPolicyFile()
+        {
+            Console.WriteLine("--- Checking SiPolicy.p7b ---");
+            Console.WriteLine();
+
+            string siPolicyPath = @"C:\Windows\System32\CodeIntegrity\SiPolicy.p7b";
+            
+            if (File.Exists(siPolicyPath))
+            {
+                Console.WriteLine(String.Format("Found: {0}", siPolicyPath));
+                FileInfo fi = new FileInfo(siPolicyPath);
+                Console.WriteLine(String.Format("Size: {0} bytes, Modified: {1}", fi.Length, fi.LastWriteTime));
+                Console.WriteLine();
+                
+                ExtractCertificatesFromPolicy(siPolicyPath);
+            }
+            else
+            {
+                Console.WriteLine("SiPolicy.p7b not found");
+                Console.WriteLine();
+            }
+        }
+
+        private static void DisplayCertificateCapabilities(X509Certificate2 cert)
+        {
+            foreach (X509Extension ext in cert.Extensions)
+            {
+                if (ext.Oid.Value == "2.5.29.37") // Enhanced Key Usage
+                {
+                    X509EnhancedKeyUsageExtension ekuExt = (X509EnhancedKeyUsageExtension)ext;
+                    Console.WriteLine("      Enhanced Key Usage:");
+                    foreach (System.Security.Cryptography.Oid oid in ekuExt.EnhancedKeyUsages)
+                    {
+                        string friendlyName = GetEKUFriendlyName(oid.Value);
+                        Console.WriteLine(String.Format("        - {0} ({1})", friendlyName, oid.Value));
+                    }
+                }
+            }
+        }
+
+        private static string GetEKUFriendlyName(string oid)
+        {
+            switch (oid)
+            {
+                case "1.3.6.1.4.1.311.61.1.1":
+                    return "Kernel Mode Code Signing";
+                case "1.3.6.1.4.1.311.10.3.6":
+                    return "Windows System Component Verification";
+                case "1.3.6.1.4.1.311.10.3.5":
+                    return "Windows Hardware Driver Verification";
+                case "1.3.6.1.4.1.311.76.6.1":
+                    return "Windows TCB Component";
+                case "1.3.6.1.5.5.7.3.3":
+                    return "Code Signing";
+                case "1.3.6.1.4.1.311.10.3.39":
+                    return "Windows Store";
+                default:
+                    return oid;
+            }
+        }
+
+        private static void ReadDetailedPolicyRegistry()
+        {
+            Console.WriteLine("--- Detailed Policy Registry Information ---");
+            Console.WriteLine();
+
+            string[] registryPaths = new string[]
+            {
+                @"SYSTEM\CurrentControlSet\Control\CI\Policy",
+                @"SYSTEM\CurrentControlSet\Control\CI\PolicyInformation",
+                @"SYSTEM\CurrentControlSet\Control\CI\TrustPointConfig",
+                @"SYSTEM\CurrentControlSet\Control\CI\Protected",
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\Microsoft-Windows-CodeIntegrity/Operational"
+            };
+
+            foreach (string path in registryPaths)
+            {
+                ReadRegistryKeyRecursive(path, 0);
+            }
+        }
+
+        private static void ReadRegistryKeyRecursive(string path, int depth)
+        {
+            if (depth > 3) return; // Limit recursion
+
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(path))
+                {
+                    if (key != null)
+                    {
+                        string indent = new string(' ', depth * 2);
+                        Console.WriteLine(String.Format("{0}[HKLM\\{1}]", indent, path));
+
+                        foreach (string valueName in key.GetValueNames())
+                        {
+                            object value = key.GetValue(valueName);
+                            
+                            if (value is byte[])
+                            {
+                                byte[] bytes = (byte[])value;
+                                if (bytes.Length <= 64)
+                                {
+                                    Console.WriteLine(String.Format("{0}  {1} = {2}", 
+                                        indent, valueName, BitConverter.ToString(bytes).Replace("-", " ")));
+                                }
+                                else
+                                {
+                                    Console.WriteLine(String.Format("{0}  {1} = [Binary: {2} bytes]", 
+                                        indent, valueName, bytes.Length));
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine(String.Format("{0}  {1} = {2}", indent, valueName, value));
+                            }
+                        }
+
+                        foreach (string subKeyName in key.GetSubKeyNames())
+                        {
+                            ReadRegistryKeyRecursive(path + "\\" + subKeyName, depth + 1);
+                        }
+                        
+                        Console.WriteLine();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Silently skip inaccessible keys
+            }
+        }
+
+        private static void ScanAllCertificateStores()
+        {
+            Console.WriteLine("--- Scanning All Certificate Stores ---");
+            Console.WriteLine();
+
+            StoreLocation[] locations = new StoreLocation[] { StoreLocation.LocalMachine, StoreLocation.CurrentUser };
+            StoreName[] storeNames = (StoreName[])Enum.GetValues(typeof(StoreName));
+
+            int totalFound = 0;
+
+            foreach (StoreLocation location in locations)
+            {
+                foreach (StoreName storeName in storeNames)
+                {
+                    try
+                    {
+                        X509Store store = new X509Store(storeName, location);
+                        store.Open(OpenFlags.ReadOnly);
+
+                        foreach (X509Certificate2 cert in store.Certificates)
+                        {
+                            if (IsInterestingCert(cert))
+                            {
+                                if (totalFound == 0)
+                                {
+                                    Console.WriteLine("Found interesting certificates:");
+                                }
+                                
+                                Console.WriteLine(String.Format("  Store: {0}\\{1}", location, storeName));
+                                Console.WriteLine(String.Format("  Subject: {0}", cert.Subject));
+                                Console.WriteLine(String.Format("  Issuer: {0}", cert.Issuer));
+                                Console.WriteLine(String.Format("  Thumbprint: {0}", cert.Thumbprint));
+                                DisplayCertificateCapabilities(cert);
+                                Console.WriteLine();
+                                totalFound++;
+                            }
+                        }
+
+                        store.Close();
+                    }
+                    catch { }
+                }
+            }
+
+            if (totalFound == 0)
+            {
+                Console.WriteLine("No custom/interesting certificates found in standard stores");
+                Console.WriteLine();
+            }
+        }
+
+        private static bool IsInterestingCert(X509Certificate2 cert)
+        {
+            // Look for non-Microsoft root certificates or self-signed certs
+            if (cert.Issuer == cert.Subject && !cert.Subject.Contains("Microsoft"))
+            {
+                return true;
+            }
+
+            // Look for kernel signing OIDs
+            foreach (X509Extension ext in cert.Extensions)
+            {
+                if (ext.Oid.Value == "2.5.29.37")
+                {
+                    X509EnhancedKeyUsageExtension ekuExt = (X509EnhancedKeyUsageExtension)ext;
+                    foreach (System.Security.Cryptography.Oid oid in ekuExt.EnhancedKeyUsages)
+                    {
+                        if (oid.Value == "1.3.6.1.4.1.311.61.1.1" || 
+                            oid.Value == "1.3.6.1.4.1.311.10.3.6" ||
+                            oid.Value == "1.3.6.1.4.1.311.10.3.5")
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void CheckTestSignedDrivers()
+        {
+            Console.WriteLine("--- Checking for Test-Signed Drivers ---");
+            Console.WriteLine();
+
+            string driverDir = @"C:\Windows\System32\drivers";
+            
+            try
+            {
+                if (Directory.Exists(driverDir))
+                {
+                    string[] driverFiles = Directory.GetFiles(driverDir, "*.sys");
+                    int testSignedCount = 0;
+
+                    foreach (string driverFile in driverFiles)
+                    {
+                        try
+                        {
+                            X509Certificate2 cert = new X509Certificate2(X509Certificate.CreateFromSignedFile(driverFile));
+                            
+                            if (cert.Subject.Contains("Test") || cert.Issuer.Contains("Test") || 
+                                !cert.Subject.Contains("Microsoft"))
+                            {
+                                testSignedCount++;
+                                Console.WriteLine(String.Format("  Driver: {0}", Path.GetFileName(driverFile)));
+                                Console.WriteLine(String.Format("    Signed by: {0}", cert.Subject));
+                                Console.WriteLine(String.Format("    Issuer: {0}", cert.Issuer));
+                                Console.WriteLine();
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (testSignedCount == 0)
+                    {
+                        Console.WriteLine("No test-signed or non-Microsoft drivers found");
+                        Console.WriteLine();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(String.Format("Error: {0}", ex.Message));
+                Console.WriteLine();
+            }
+        }
+
+        private static void CheckSecureBootVariables()
+        {
+            Console.WriteLine("--- UEFI Secure Boot Variables ---");
+            Console.WriteLine();
+            Console.WriteLine("Note: UEFI variables require special access and may not be readable");
+            Console.WriteLine();
+
+            // Attempt to check if Secure Boot is enabled via registry
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\SecureBoot\State"))
+                {
+                    if (key != null)
+                    {
+                        object uefiSecureBootEnabled = key.GetValue("UEFISecureBootEnabled");
+                        if (uefiSecureBootEnabled != null)
+                        {
+                            Console.WriteLine(String.Format("Secure Boot Enabled: {0}", uefiSecureBootEnabled));
+                            Console.WriteLine();
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void ScanDriverStore()
+        {
+            Console.WriteLine("--- Scanning Driver Store ---");
+            Console.WriteLine();
+
+            string driverStore = @"C:\Windows\System32\DriverStore\FileRepository";
+            
+            try
+            {
+                if (Directory.Exists(driverStore))
+                {
+                    string[] subDirs = Directory.GetDirectories(driverStore);
+                    int customSignedCount = 0;
+
+                    foreach (string dir in subDirs)
+                    {
+                        try
+                        {
+                            string[] sysFiles = Directory.GetFiles(dir, "*.sys", SearchOption.AllDirectories);
+                            
+                            foreach (string sysFile in sysFiles)
+                            {
+                                try
+                                {
+                                    X509Certificate2 cert = new X509Certificate2(X509Certificate.CreateFromSignedFile(sysFile));
+                                    
+                                    if (!cert.Subject.Contains("Microsoft Corporation"))
+                                    {
+                                        customSignedCount++;
+                                        Console.WriteLine(String.Format("  Custom-signed driver: {0}", Path.GetFileName(sysFile)));
+                                        Console.WriteLine(String.Format("    Path: {0}", dir));
+                                        Console.WriteLine(String.Format("    Signer: {0}", cert.Subject));
+                                        Console.WriteLine();
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (customSignedCount == 0)
+                    {
+                        Console.WriteLine("No custom-signed drivers found in driver store");
+                        Console.WriteLine();
+                    }
+                    else
+                    {
+                        Console.WriteLine(String.Format("Total custom-signed drivers found: {0}", customSignedCount));
+                        Console.WriteLine();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(String.Format("Error: {0}", ex.Message));
                 Console.WriteLine();
             }
         }
 
         public static void Main(string[] args)
         {
-            Console.WriteLine("Custom Kernel Signer Reader");
-            Console.WriteLine("===========================");
+            Console.WriteLine("Custom Kernel Signer Reader - Enhanced Edition");
+            Console.WriteLine("================================================");
             Console.WriteLine();
 
-            // Check if running as SYSTEM
             if (!IsRunningAsSystem())
             {
                 Console.WriteLine("WARNING: Not running as SYSTEM.");
-                Console.WriteLine("This program requires SYSTEM privileges for full access.");
-                Console.WriteLine("Current user: " + WindowsIdentity.GetCurrent().Name);
-                Console.WriteLine();
-                Console.WriteLine("To run as SYSTEM, use PsExec:");
-                Console.WriteLine("  psexec -s -i YourProgram.exe");
+                Console.WriteLine("Some information may be inaccessible.");
                 Console.WriteLine();
             }
             else
@@ -421,21 +714,23 @@ private static bool IsKernelCodeSigningCert(X509Certificate2 cert)
                 Console.WriteLine();
             }
 
-            // Enable debug privilege
             if (EnableDebugPrivilege())
             {
                 Console.WriteLine("Debug privilege enabled.");
                 Console.WriteLine();
             }
 
-            // Query Code Integrity status
             QueryCodeIntegrityStatus();
-
-            // Read Custom Kernel Signers
             ReadCustomKernelSigners();
 
-            Console.WriteLine("Press any key to exit...");
-            Console.ReadKey();
+            Console.WriteLine("=== Scan Complete ===");
+            Console.WriteLine();
+            
+            if (!IsRunningAsSystem())
+            {
+                Console.WriteLine("Press any key to exit...");
+                Console.ReadKey();
+            }
         }
     }
 }
